@@ -5,7 +5,9 @@ import (
 	"fmt"
 	"nssm-plus/internal/config"
 	"nssm-plus/internal/service"
+	"os"
 	"os/exec"
+	"strings"
 	"sync"
 	"syscall"
 
@@ -91,6 +93,17 @@ func (a *App) GetServiceConfig(serviceName string) (*service.ServiceConfig, erro
 
 // --- File Dialog Operations (via Wails Go runtime) ---
 
+// ShowOpenDialog opens a native Open File dialog filtered for JSON config files.
+func (a *App) ShowOpenDialog(title string) (string, error) {
+	return runtime.OpenFileDialog(a.ctx, runtime.OpenDialogOptions{
+		Title: title,
+		Filters: []runtime.FileFilter{
+			{DisplayName: "JSON Files (*.json)", Pattern: "*.json"},
+			{DisplayName: "All Files (*.*)", Pattern: "*.*"},
+		},
+	})
+}
+
 // ShowSaveDialog opens a native Save File dialog and returns the selected path
 func (a *App) ShowSaveDialog(title string, defaultFilename string) (string, error) {
 	return runtime.SaveFileDialog(a.ctx, runtime.SaveDialogOptions{
@@ -102,14 +115,35 @@ func (a *App) ShowSaveDialog(title string, defaultFilename string) (string, erro
 	})
 }
 
-// ShowOpenDialog opens a native Open File dialog and returns the selected path
-func (a *App) ShowOpenDialog(title string) (string, error) {
+// ShowOpenAppDialog opens a native Open File dialog filtered for executables.
+func (a *App) ShowOpenAppDialog(title string) (string, error) {
 	return runtime.OpenFileDialog(a.ctx, runtime.OpenDialogOptions{
 		Title: title,
 		Filters: []runtime.FileFilter{
-			{DisplayName: "JSON Files (*.json)", Pattern: "*.json"},
+			{DisplayName: "Executables (*.exe;*.bat;*.cmd;*.ps1)", Pattern: "*.exe;*.bat;*.cmd;*.ps1"},
+			{DisplayName: "All Files (*.*)", Pattern: "*.*"},
 		},
 	})
+}
+
+// ShowOpenDirectoryDialog opens a native directory picker dialog.
+func (a *App) ShowOpenDirectoryDialog(title string) (string, error) {
+	return runtime.OpenDirectoryDialog(a.ctx, runtime.OpenDialogOptions{
+		Title: title,
+	})
+}
+
+// ValidateAppPath checks if a given application path exists on disk.
+func (a *App) ValidateAppPath(appPath string) error {
+	trimmed := strings.TrimSpace(appPath)
+	if trimmed == "" {
+		return fmt.Errorf("application path is required")
+	}
+	trimmed = strings.Trim(trimmed, `"`)
+	if _, err := os.Stat(trimmed); err != nil {
+		return fmt.Errorf("application path does not exist: %s", trimmed)
+	}
+	return nil
 }
 
 // --- Config File Operations (multi-service) ---

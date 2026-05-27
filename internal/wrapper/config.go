@@ -8,9 +8,10 @@ import (
 )
 
 const (
-	baseDirName = "NSSM-Plus"
-	servicesDir = "services"
-	logsDirName = "logs"
+	baseDirName    = "NSSM-Plus"
+	servicesDir    = "services"
+	logsDirName    = "logs"
+	defaultLogSize = 10 * 1024 * 1024 // 10 MB default log rotation size
 )
 
 // ConfigDir returns the base directory for NSSM-Plus data.
@@ -45,10 +46,15 @@ func LogPath(serviceName string) string {
 
 // WrapperConfig holds the application launch configuration for a service.
 type WrapperConfig struct {
-	AppPath   string            `json:"appPath"`
-	Arguments string            `json:"arguments"`
-	WorkDir   string            `json:"workDir"`
-	Env       map[string]string `json:"env,omitempty"`
+	AppPath        string            `json:"appPath"`
+	Arguments      string            `json:"arguments"`
+	WorkDir        string            `json:"workDir"`
+	Env            map[string]string `json:"env,omitempty"`
+	RestartDelay   int               `json:"restartDelay"`
+	LogStdout      string            `json:"logStdout,omitempty"`
+	LogStderr      string            `json:"logStderr,omitempty"`
+	RotateLog      bool              `json:"rotateLog,omitempty"`
+	RestartTimeout int               `json:"restartTimeout,omitempty"`
 }
 
 // SaveConfig writes the wrapper config to disk.
@@ -88,12 +94,54 @@ func DeleteConfig(serviceName string) error {
 }
 
 // splitArgs splits a command-line argument string into individual arguments.
-// It handles simple whitespace splitting. For quoted arguments, a more
-// sophisticated parser would be needed, but this covers common cases.
+// It properly handles quoted arguments (both single and double quotes).
+// Examples:
+//
+//	"-jar \"C:\\My App\\app.jar\"" -> ["-jar", "C:\\My App\\app.jar"]
+//	"--config='my config.json'"     -> ["--config=my config.json"]
+//	"say \"hello world\""           -> ["say", "hello world"]
 func splitArgs(argStr string) []string {
 	argStr = strings.TrimSpace(argStr)
 	if argStr == "" {
 		return nil
 	}
-	return strings.Fields(argStr)
+
+	var args []string
+	var current strings.Builder
+	inQuote := false
+	var quoteChar byte
+
+	for i := 0; i < len(argStr); i++ {
+		ch := argStr[i]
+
+		if inQuote {
+			if ch == '\\' && i+1 < len(argStr) && (argStr[i+1] == quoteChar || argStr[i+1] == '\\') {
+				current.WriteByte(argStr[i+1])
+				i++
+			} else if ch == quoteChar {
+				inQuote = false
+			} else {
+				current.WriteByte(ch)
+			}
+		} else {
+			switch ch {
+			case '"', '\'':
+				inQuote = true
+				quoteChar = ch
+			case ' ', '\t':
+				if current.Len() > 0 {
+					args = append(args, current.String())
+					current.Reset()
+				}
+			default:
+				current.WriteByte(ch)
+			}
+		}
+	}
+
+	if current.Len() > 0 {
+		args = append(args, current.String())
+	}
+
+	return args
 }

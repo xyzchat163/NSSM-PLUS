@@ -2,6 +2,7 @@ package service
 
 import (
 	"fmt"
+	"log"
 	"os"
 	"strings"
 	"syscall"
@@ -9,10 +10,12 @@ import (
 	"unicode/utf16"
 	"unsafe"
 
+	"nssm-plus/internal/common"
+	"nssm-plus/internal/wrapper"
+
 	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/svc"
 	"golang.org/x/sys/windows/svc/mgr"
-	"nssm-plus/internal/wrapper"
 )
 
 const (
@@ -89,47 +92,95 @@ func buildDescription(desc, appPath string) string {
 	return fmt.Sprintf("[%s] %s", nssmPlusMarker, desc)
 }
 
-// Install creates a new Windows service
-func (m *Manager) Install(cfg ServiceConfig) error {
-	if cfg.ServiceName == "" {
+// validateServiceName checks that a service name contains only valid characters.
+// Windows service names: up to 256 chars, letters, digits, spaces, and limited special chars.
+func validateServiceName(name string) error {
+	if name == "" {
 		return fmt.Errorf("service name is required")
 	}
-	if cfg.AppPath == "" {
+	if len(name) > 256 {
+		return fmt.Errorf("service name must be 256 characters or less")
+	}
+	for _, ch := range name {
+		if !isValidServiceNameChar(ch) {
+			return fmt.Errorf("service name contains invalid character: '%c' (allowed: letters, digits, spaces, _-.)", ch)
+		}
+	}
+	return nil
+}
+
+func isValidServiceNameChar(ch rune) bool {
+	return (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
+		(ch >= '0' && ch <= '9') || ch == ' ' || ch == '_' || ch == '-' || ch == '.'
+}
+
+// validateAppPath checks that the application path exists on disk.
+func validateAppPath(appPath string) error {
+	if appPath == "" {
 		return fmt.Errorf("application path is required")
+	}
+	trimmed := strings.TrimSpace(appPath)
+	// Remove surrounding quotes for the check
+	trimmed = strings.Trim(trimmed, `"`)
+	if _, err := os.Stat(trimmed); err != nil {
+		return fmt.Errorf("application path does not exist: %s", trimmed)
+	}
+	return nil
+}
+
+// Install creates a new Windows service
+func (m *Manager) Install(cfg ServiceConfig) error {
+	log.Printf("[service] Install: name=%q, appPath=%q, args=%q, dir=%q, startType=%q, account=%q",
+		cfg.ServiceName, cfg.AppPath, cfg.Arguments, cfg.WorkDir, cfg.StartType, cfg.Account)
+
+	if err := validateServiceName(cfg.ServiceName); err != nil {
+		log.Printf("[service] Install: validation failed for service name: %v", err)
+		return err
+	}
+	if err := validateAppPath(cfg.AppPath); err != nil {
+		log.Printf("[service] Install: validation failed for app path: %v", err)
+		return err
 	}
 
 	scMgr, err := connectSCM()
 	if err != nil {
+		log.Printf("[service] Install: failed to connect to SCM: %v", err)
 		return err
 	}
 	defer scMgr.Disconnect()
 
-	// Check if service already exists
 	existingSvc, err := scMgr.OpenService(cfg.ServiceName)
 	if err == nil {
 		existingSvc.Close()
+		log.Printf("[service] Install: service '%s' already exists", cfg.ServiceName)
 		return fmt.Errorf("service '%s' already exists. Use Modify to update it", cfg.ServiceName)
 	}
 
-	// Save wrapper config to ProgramData
 	wrapperCfg := &wrapper.WrapperConfig{
-		AppPath:   strings.TrimSpace(cfg.AppPath),
-		Arguments: strings.TrimSpace(cfg.Arguments),
-		WorkDir:   strings.TrimSpace(cfg.WorkDir),
-		Env:       cfg.Environment,
+		AppPath:        strings.TrimSpace(cfg.AppPath),
+		Arguments:      strings.TrimSpace(cfg.Arguments),
+		WorkDir:        strings.TrimSpace(cfg.WorkDir),
+		Env:            cfg.Environment,
+		RestartDelay:   cfg.RestartDelay,
+		LogStdout:      strings.TrimSpace(cfg.LogStdout),
+		LogStderr:      strings.TrimSpace(cfg.LogStderr),
+		RotateLog:      cfg.RotateLog,
+		RestartTimeout: cfg.RestartTimeout,
 	}
 	if err := wrapper.SaveConfig(cfg.ServiceName, wrapperCfg); err != nil {
+		log.Printf("[service] Install: failed to save wrapper config for '%s': %v", cfg.ServiceName, err)
 		return fmt.Errorf("failed to save wrapper config: %w", err)
 	}
+	log.Printf("[service] Install: wrapper config saved for '%s'", cfg.ServiceName)
 
-	// Build BinaryPathName: point to current exe as service wrapper
 	exePath, err := os.Executable()
 	if err != nil {
+		log.Printf("[service] Install: failed to get executable path: %v", err)
 		return fmt.Errorf("failed to get executable path: %w", err)
 	}
 	binaryPath := wrapper.GetWrapperBinaryPath(exePath, cfg.ServiceName)
+	log.Printf("[service] Install: binaryPath=%q", binaryPath)
 
-	// Create service
 	desc := buildDescription(cfg.Description, cfg.AppPath)
 	h, err := windows.CreateService(
 		scMgr.Handle,
@@ -140,55 +191,62 @@ func (m *Manager) Install(cfg ServiceConfig) error {
 		toMgrStartType(cfg.StartType),
 		windows.SERVICE_ERROR_NORMAL,
 		syscall.StringToUTF16Ptr(binaryPath),
-		nil, // loadOrderGroup
-		nil, // tagId
+		nil,
+		nil,
 		toStringBlock(cfg.Dependencies),
 		syscall.StringToUTF16Ptr(cfg.Account),
 		syscall.StringToUTF16Ptr(cfg.Password),
 	)
 	if err != nil {
+		log.Printf("[service] Install: CreateService failed for '%s': %v", cfg.ServiceName, err)
 		return fmt.Errorf("failed to create service: %w", err)
 	}
 	defer windows.CloseServiceHandle(h)
 
-	// Update description via ChangeServiceConfig2
 	if desc != "" {
 		d := windows.SERVICE_DESCRIPTION{Description: syscall.StringToUTF16Ptr(desc)}
 		windows.ChangeServiceConfig2(h, windows.SERVICE_CONFIG_DESCRIPTION, (*byte)(unsafe.Pointer(&d)))
 	}
 
+	log.Printf("[service] Install: service '%s' installed successfully", cfg.ServiceName)
 	return nil
 }
 
 // Remove deletes an existing Windows service
 func (m *Manager) Remove(serviceName string) error {
+	log.Printf("[service] Remove: name=%q", serviceName)
+
 	scMgr, err := connectSCM()
 	if err != nil {
+		log.Printf("[service] Remove: failed to connect to SCM: %v", err)
 		return err
 	}
 	defer scMgr.Disconnect()
 
 	s, err := scMgr.OpenService(serviceName)
 	if err != nil {
+		log.Printf("[service] Remove: failed to open service '%s': %v", serviceName, err)
 		return fmt.Errorf("failed to open service '%s': %w", serviceName, err)
 	}
 
-	// Stop the service first if it's running, then wait for it to fully stop
 	status, err := s.Query()
 	if err != nil {
 		s.Close()
+		log.Printf("[service] Remove: failed to query service '%s' status: %v", serviceName, err)
 		return fmt.Errorf("failed to query service status: %w", err)
 	}
+
 	if status.State != svc.Stopped {
+		log.Printf("[service] Remove: service '%s' is running (state=%d), stopping first...", serviceName, status.State)
 		_, err = s.Control(svc.Stop)
 		if err != nil {
 			if !strings.Contains(err.Error(), "not been started") &&
 				!strings.Contains(err.Error(), "not running") {
 				s.Close()
+				log.Printf("[service] Remove: failed to stop service '%s': %v", serviceName, err)
 				return fmt.Errorf("failed to stop service before removal: %w", err)
 			}
 		}
-		// Wait for the service to fully stop (up to 15 seconds)
 		for i := 0; i < 30; i++ {
 			time.Sleep(500 * time.Millisecond)
 			st, err := s.Query()
@@ -196,118 +254,170 @@ func (m *Manager) Remove(serviceName string) error {
 				break
 			}
 			if st.State == svc.Stopped {
+				log.Printf("[service] Remove: service '%s' stopped (waited %dms)", serviceName, (i+1)*500)
 				break
 			}
 		}
 	}
 
-	// Delete must be called before closing the handle, but close immediately after
 	err = s.Delete()
 	s.Close()
 	if err != nil {
 		if strings.Contains(err.Error(), "marked for deletion") {
+			log.Printf("[service] Remove: service '%s' already marked for deletion", serviceName)
 			return fmt.Errorf("service '%s' is already marked for deletion (will be removed on next restart or after handles are released)", serviceName)
 		}
+		log.Printf("[service] Remove: failed to delete service '%s': %v", serviceName, err)
 		return fmt.Errorf("failed to delete service: %w", err)
 	}
 
-	// Clean up wrapper config
 	wrapper.DeleteConfig(serviceName)
-
+	log.Printf("[service] Remove: service '%s' removed successfully", serviceName)
 	return nil
 }
 
 // Start starts a Windows service
 func (m *Manager) Start(serviceName string) error {
+	log.Printf("[service] Start: name=%q", serviceName)
+
 	scMgr, err := connectSCM()
 	if err != nil {
+		log.Printf("[service] Start: failed to connect to SCM: %v", err)
 		return err
 	}
 	defer scMgr.Disconnect()
 
 	s, err := scMgr.OpenService(serviceName)
 	if err != nil {
+		log.Printf("[service] Start: failed to open service '%s': %v", serviceName, err)
 		return fmt.Errorf("failed to open service '%s': %w", serviceName, err)
 	}
 	defer s.Close()
 
 	err = s.Start()
 	if err != nil {
+		log.Printf("[service] Start: failed to start service '%s': %v", serviceName, err)
 		return fmt.Errorf("failed to start service: %w", err)
 	}
 
+	log.Printf("[service] Start: service '%s' started successfully", serviceName)
 	return nil
 }
 
 // Stop stops a running Windows service
 func (m *Manager) Stop(serviceName string) error {
+	log.Printf("[service] Stop: name=%q", serviceName)
+
 	scMgr, err := connectSCM()
 	if err != nil {
+		log.Printf("[service] Stop: failed to connect to SCM: %v", err)
 		return err
 	}
 	defer scMgr.Disconnect()
 
 	s, err := scMgr.OpenService(serviceName)
 	if err != nil {
+		log.Printf("[service] Stop: failed to open service '%s': %v", serviceName, err)
 		return fmt.Errorf("failed to open service '%s': %w", serviceName, err)
 	}
 	defer s.Close()
 
 	_, err = s.Control(svc.Stop)
 	if err != nil {
+		log.Printf("[service] Stop: failed to stop service '%s': %v", serviceName, err)
 		return fmt.Errorf("failed to stop service: %w", err)
 	}
 
+	log.Printf("[service] Stop: stop signal sent to service '%s'", serviceName)
 	return nil
 }
 
 // Restart stops and then starts a Windows service
 func (m *Manager) Restart(serviceName string) error {
+	log.Printf("[service] Restart: name=%q", serviceName)
+
 	err := m.Stop(serviceName)
 	if err != nil {
-		// If service is not running, just try starting it
 		if !strings.Contains(err.Error(), "not been started") &&
 			!strings.Contains(err.Error(), "not running") {
+			log.Printf("[service] Restart: failed to stop service '%s': %v", serviceName, err)
 			return fmt.Errorf("failed to stop service for restart: %w", err)
 		}
+		log.Printf("[service] Restart: service '%s' was not running, proceeding with start", serviceName)
 	}
+
+	scMgr, err := connectSCM()
+	if err != nil {
+		log.Printf("[service] Restart: failed to connect to SCM for wait: %v", err)
+		return err
+	}
+	defer scMgr.Disconnect()
+
+	s, err := scMgr.OpenService(serviceName)
+	if err == nil {
+		for i := 0; i < 30; i++ {
+			status, qErr := s.Query()
+			if qErr != nil || status.State == svc.Stopped {
+				if qErr == nil {
+					log.Printf("[service] Restart: service '%s' reached Stopped state (waited %dms)", serviceName, (i+1)*500)
+				}
+				break
+			}
+			time.Sleep(500 * time.Millisecond)
+		}
+		s.Close()
+	}
+
+	log.Printf("[service] Restart: starting service '%s'...", serviceName)
 	return m.Start(serviceName)
 }
 
 // GetStatus queries the current status of a service
 func (m *Manager) GetStatus(serviceName string) (string, error) {
+	log.Printf("[service] GetStatus: name=%q", serviceName)
+
 	scMgr, err := connectSCM()
 	if err != nil {
+		log.Printf("[service] GetStatus: failed to connect to SCM: %v", err)
 		return "", err
 	}
 	defer scMgr.Disconnect()
 
 	s, err := scMgr.OpenService(serviceName)
 	if err != nil {
+		log.Printf("[service] GetStatus: failed to open service '%s': %v", serviceName, err)
 		return "", fmt.Errorf("failed to open service '%s': %w", serviceName, err)
 	}
 	defer s.Close()
 
 	status, err := s.Query()
 	if err != nil {
+		log.Printf("[service] GetStatus: failed to query service '%s': %v", serviceName, err)
 		return "", fmt.Errorf("failed to query service status: %w", err)
 	}
 
-	return statusToString(status.State), nil
+	result := statusToString(status.State)
+	log.Printf("[service] GetStatus: service '%s' status=%s", serviceName, result)
+	return result, nil
 }
 
 // ListServices lists all services managed by NSSM Plus
 func (m *Manager) ListServices() ([]ServiceInfo, error) {
+	log.Printf("[service] ListServices: scanning for NSSM Plus managed services")
+
 	scMgr, err := connectSCM()
 	if err != nil {
+		log.Printf("[service] ListServices: failed to connect to SCM: %v", err)
 		return nil, err
 	}
 	defer scMgr.Disconnect()
 
 	services, err := scMgr.ListServices()
 	if err != nil {
+		log.Printf("[service] ListServices: failed to list services: %v", err)
 		return nil, fmt.Errorf("failed to list services: %w", err)
 	}
+	log.Printf("[service] ListServices: total Windows services found: %d", len(services))
 
 	var result []ServiceInfo
 	for _, name := range services {
@@ -339,7 +449,6 @@ func (m *Manager) ListServices() ([]ServiceInfo, error) {
 			Status:      statusToString(status.State),
 			StartType:   startTypeToString(cfg.StartType),
 		}
-		// Show real AppPath for wrapper services
 		if wrapper.IsWrapperBinaryPath(cfg.BinaryPathName) {
 			svcName := wrapper.ExtractServiceName(cfg.BinaryPathName)
 			if svcName != "" && wrapper.ConfigExists(svcName) {
@@ -354,41 +463,68 @@ func (m *Manager) ListServices() ([]ServiceInfo, error) {
 		s.Close()
 	}
 
+	log.Printf("[service] ListServices: found %d NSSM Plus managed services", len(result))
 	return result, nil
 }
 
 // Modify updates an existing service configuration
 func (m *Manager) Modify(oldName string, cfg ServiceConfig) error {
+	log.Printf("[service] Modify: oldName=%q, newName=%q, appPath=%q, startType=%q",
+		oldName, cfg.ServiceName, cfg.AppPath, cfg.StartType)
+
 	scMgr, err := connectSCM()
 	if err != nil {
+		log.Printf("[service] Modify: failed to connect to SCM: %v", err)
 		return err
 	}
 	defer scMgr.Disconnect()
 
 	s, err := scMgr.OpenService(oldName)
 	if err != nil {
+		log.Printf("[service] Modify: failed to open service '%s': %v", oldName, err)
 		return fmt.Errorf("failed to open service '%s': %w", oldName, err)
 	}
 	defer s.Close()
 
-	// Build binary path: UpdateConfig passes BinaryPathName directly to ChangeServiceConfigW,
-	// no syscall.EscapeArg involved, so just concatenate appPath + args.
-	binaryPath := strings.TrimSpace(cfg.AppPath)
-	args := strings.TrimSpace(cfg.Arguments)
-	if args != "" {
-		binaryPath = binaryPath + " " + args
+	currentCfg, err := s.Config()
+	if err != nil {
+		log.Printf("[service] Modify: failed to get current config for '%s': %v", oldName, err)
+		return fmt.Errorf("failed to get current service config: %w", err)
 	}
 
-	// Update wrapper config
+	var binaryPath string
+	if common.IsWrapperBinaryPath(currentCfg.BinaryPathName) {
+		exePath, err := os.Executable()
+		if err != nil {
+			log.Printf("[service] Modify: failed to get executable path: %v", err)
+			return fmt.Errorf("failed to get executable path: %w", err)
+		}
+		binaryPath = common.GetWrapperBinaryPath(exePath, oldName)
+	} else {
+		binaryPath = strings.TrimSpace(cfg.AppPath)
+		args := strings.TrimSpace(cfg.Arguments)
+		if args != "" {
+			binaryPath = binaryPath + " " + args
+		}
+	}
+	log.Printf("[service] Modify: binaryPath=%q", binaryPath)
+
 	wrapperCfg := &wrapper.WrapperConfig{
-		AppPath:   strings.TrimSpace(cfg.AppPath),
-		Arguments: strings.TrimSpace(cfg.Arguments),
-		WorkDir:   strings.TrimSpace(cfg.WorkDir),
-		Env:       cfg.Environment,
+		AppPath:        strings.TrimSpace(cfg.AppPath),
+		Arguments:      strings.TrimSpace(cfg.Arguments),
+		WorkDir:        strings.TrimSpace(cfg.WorkDir),
+		Env:            cfg.Environment,
+		RestartDelay:   cfg.RestartDelay,
+		LogStdout:      strings.TrimSpace(cfg.LogStdout),
+		LogStderr:      strings.TrimSpace(cfg.LogStderr),
+		RotateLog:      cfg.RotateLog,
+		RestartTimeout: cfg.RestartTimeout,
 	}
 	if err := wrapper.SaveConfig(oldName, wrapperCfg); err != nil {
+		log.Printf("[service] Modify: failed to update wrapper config for '%s': %v", oldName, err)
 		return fmt.Errorf("failed to update wrapper config: %w", err)
 	}
+	log.Printf("[service] Modify: wrapper config updated for '%s'", oldName)
 
 	err = s.UpdateConfig(mgr.Config{
 		ServiceType:      serviceNoChange,
@@ -402,28 +538,35 @@ func (m *Manager) Modify(oldName string, cfg ServiceConfig) error {
 		Dependencies:     cfg.Dependencies,
 	})
 	if err != nil {
+		log.Printf("[service] Modify: UpdateConfig failed for '%s': %v", oldName, err)
 		return fmt.Errorf("failed to update service config: %w", err)
 	}
 
+	log.Printf("[service] Modify: service '%s' updated successfully", oldName)
 	return nil
 }
 
 // GetServiceConfig retrieves the full configuration of a service
 func (m *Manager) GetServiceConfig(serviceName string) (*ServiceConfig, error) {
+	log.Printf("[service] GetServiceConfig: name=%q", serviceName)
+
 	scMgr, err := connectSCM()
 	if err != nil {
+		log.Printf("[service] GetServiceConfig: failed to connect to SCM: %v", err)
 		return nil, err
 	}
 	defer scMgr.Disconnect()
 
 	s, err := scMgr.OpenService(serviceName)
 	if err != nil {
+		log.Printf("[service] GetServiceConfig: failed to open service '%s': %v", serviceName, err)
 		return nil, fmt.Errorf("failed to open service '%s': %w", serviceName, err)
 	}
 	defer s.Close()
 
 	cfg, err := s.Config()
 	if err != nil {
+		log.Printf("[service] GetServiceConfig: failed to get config for '%s': %v", serviceName, err)
 		return nil, fmt.Errorf("failed to get service config: %w", err)
 	}
 
@@ -435,9 +578,9 @@ func (m *Manager) GetServiceConfig(serviceName string) (*ServiceConfig, error) {
 		Account:     cfg.ServiceStartName,
 	}
 
-	// If this is a wrapper-managed service, read appPath/arguments from wrapper config
 	if wrapper.IsWrapperBinaryPath(cfg.BinaryPathName) {
 		svcName := wrapper.ExtractServiceName(cfg.BinaryPathName)
+		log.Printf("[service] GetServiceConfig: service '%s' is wrapper-managed, extractedName=%q", serviceName, svcName)
 		if svcName != "" && wrapper.ConfigExists(svcName) {
 			wCfg, err := wrapper.LoadConfig(svcName)
 			if err == nil {
@@ -445,14 +588,20 @@ func (m *Manager) GetServiceConfig(serviceName string) (*ServiceConfig, error) {
 				result.Arguments = wCfg.Arguments
 				result.WorkDir = wCfg.WorkDir
 				result.Environment = wCfg.Env
+				result.LogStdout = wCfg.LogStdout
+				result.LogStderr = wCfg.LogStderr
+				result.RotateLog = wCfg.RotateLog
+				result.RestartDelay = wCfg.RestartDelay
+				result.RestartTimeout = wCfg.RestartTimeout
+				log.Printf("[service] GetServiceConfig: loaded wrapper config for '%s' (appPath=%q)", serviceName, result.AppPath)
 				return result, nil
 			}
+			log.Printf("[service] GetServiceConfig: failed to load wrapper config for '%s': %v, falling back to BinaryPathName", svcName, err)
 		}
 	}
 
-	// Fallback: parse BinaryPathName directly (for non-wrapped services)
 	result.AppPath, result.Arguments = parseBinaryPathName(cfg.BinaryPathName)
-
+	log.Printf("[service] GetServiceConfig: parsed non-wrapper config for '%s' (appPath=%q)", serviceName, result.AppPath)
 	return result, nil
 }
 
@@ -500,83 +649,11 @@ func isNssmPlusService(description string) bool {
 }
 
 func cleanDescription(description string) string {
-	// Remove "[NSSM-Plus] " prefix from description
 	prefix := "[" + nssmPlusMarker + "] "
 	if strings.HasPrefix(description, prefix) {
 		return strings.TrimPrefix(description, prefix)
 	}
-	// Also handle "[NSSM-Plus]" case for "Managed by NSSM-Plus - path"
-	if strings.HasPrefix(description, "["+nssmPlusMarker+"] ") {
-		rest := description[len(nssmPlusMarker)+3:]
-		return rest
-	}
 	return description
-}
-
-// quoteExePath always wraps the executable path in double quotes for Windows SCM.
-// e.g. "java" -> "\"java\"", "C:\Program Files\app.exe" -> "\"C:\Program Files\app.exe\""
-// If the path is already quoted, it is returned as-is.
-func quoteExePath(path string) string {
-	path = strings.TrimSpace(path)
-	if path == "" {
-		return ""
-	}
-	if strings.HasPrefix(path, `"`) && strings.HasSuffix(path, `"`) && len(path) >= 2 {
-		return path // already quoted
-	}
-	return `"` + path + `"`
-}
-
-// quoteExeInCmdLine quotes the executable part of a command line.
-// Kept for reference but no longer used in Install/Modify.
-func quoteExeInCmdLine(cmdLine string) string {
-	cmdLine = strings.TrimSpace(cmdLine)
-	if cmdLine == "" {
-		return ""
-	}
-
-	var exe string
-	var rest string
-
-	if strings.HasPrefix(cmdLine, `"`) {
-		// Already quoted — keep as-is
-		endQuote := strings.Index(cmdLine[1:], `"`)
-		if endQuote >= 0 {
-			return cmdLine
-		}
-		// Unclosed quote, take as-is
-		return cmdLine
-	}
-
-	// Split on first space
-	idx := strings.Index(cmdLine, " ")
-	if idx < 0 {
-		exe = cmdLine
-	} else {
-		exe = cmdLine[:idx]
-		rest = cmdLine[idx:]
-	}
-
-	// Quote the exe if it contains spaces and isn't already quoted
-	if strings.Contains(exe, " ") && !strings.HasPrefix(exe, `"`) {
-		exe = `"` + exe + `"`
-	}
-
-	if rest == "" {
-		return exe
-	}
-	return exe + rest
-}
-
-// stripOuterQuotes removes surrounding quotes from a path string.
-// Windows SCM may store BinaryPathName as "java" -jar app.jar,
-// this strips the outer quotes to get: java -jar app.jar
-func stripOuterQuotes(s string) string {
-	s = strings.TrimSpace(s)
-	if len(s) >= 2 && s[0] == '"' && s[len(s)-1] == '"' {
-		return s[1 : len(s)-1]
-	}
-	return s
 }
 
 // parseBinaryPathName splits BinaryPathName into appPath and arguments.

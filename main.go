@@ -4,10 +4,12 @@ import (
 	"embed"
 	"log"
 	"os"
+	"strings"
 
 	"github.com/wailsapp/wails/v2"
 	"github.com/wailsapp/wails/v2/pkg/options"
 	"github.com/wailsapp/wails/v2/pkg/options/assetserver"
+	"nssm-plus/internal/cli"
 	"nssm-plus/internal/wrapper"
 )
 
@@ -23,6 +25,17 @@ func main() {
 			log.Fatalf("Service %s failed: %v", serviceName, err)
 		}
 		return
+	}
+
+	// CLI mode: nssm-plus.exe <command> [args]
+	// Recognized commands: install, remove, start, stop, restart, status, list, help
+	if len(os.Args) >= 2 {
+		cmd := strings.ToLower(os.Args[1])
+		switch cmd {
+		case "install", "remove", "uninstall", "delete", "start", "stop", "restart", "status", "list", "help", "-h", "--help", "/?":
+			cli.Run(os.Args)
+			return
+		}
 	}
 
 	// GUI mode (default)

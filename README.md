@@ -22,11 +22,21 @@
 ## 功能特性
 
 - **原生 GUI** - 直接双击打开，无需命令行启动
+- **命令行模式** - 完整 CLI 支持，`nssm-plus install/remove/start/stop/restart/status/show/edit/list/log/export/import`
 - **单页面操作** - 左侧服务列表 + 右侧配置表单，无 Tab 切换
 - **完整服务管理** - 安装、修改、启动、停止、重启、删除服务
 - **多服务配置文件** - 一份 JSON 文件统一管理多个服务配置，方便批量导入/导出
-- **服务状态监控** - 实时显示 Running / Stopped 等状态
+- **服务状态监控** - 实时显示 Running / Stopped 等状态，10 秒自动刷新
+- **环境变量编辑** - 可视化 Key-Value 编辑器，支持增删改
+- **服务依赖管理** - 可视化添加/移除服务依赖项
+- **DPAPI 密码加密** - 使用 Windows DPAPI 机器级加密保护服务账户密码
+- **日志轮转** - 按文件大小自动轮转，最多保留 5 份历史日志
+- **自定义日志路径** - 支持独立配置 stdout/stderr 日志路径
+- **崩溃自动重启** - 可配置重启延迟，进程异常退出后自动恢复
+- **优雅停止** - 可配置超时时间，先优雅终止再强制 kill
+- **安全密码输入** - CLI 支持 `--password-stdin` 和 `--password-file`，避免明文暴露
 - **暗色主题** - 现代化深色 UI
+- **组件化架构** - 前端拆分为 ServiceList / ConfigForm / ActionBar 子组件
 
 ## 技术栈
 
@@ -41,19 +51,28 @@
 
 ```
 nssm-plus/
-├── main.go                       # 入口：检测 service 模式 / 启动 Wails GUI
+├── main.go                       # 入口：检测 service 模式 / CLI / 启动 Wails GUI
 ├── app.go                        # 前后端桥接层，暴露给前端的 Go 方法
 ├── go.mod / go.sum               # Go 模块依赖
 ├── wails.json                    # Wails 项目配置
+├── Install.ps1                   # 一键安装依赖脚本
+├── Run.ps1                       # 开发模式运行脚本
+├── Build.ps1                     # 生产构建脚本
 │
 ├── internal/                     # 后端核心逻辑（不直接暴露给前端）
+│   ├── cli/
+│   │   └── cli.go                # 命令行界面（install/remove/start/stop/restart/status/show/edit/list/log/export/import）
 │   ├── service/
 │   │   └── manager.go            # Windows SCM 服务管理（安装/删除/启停/查询/修改）
 │   ├── wrapper/
-│   │   ├── config.go             # Wrapper 配置文件管理（ProgramData 持久化）
-│   │   └── wrapper.go            # Windows 服务包装器（进程托管/日志/停止）
-│   └── config/
-│       └── config.go             # 配置文件序列化（JSON 导入/导出）
+│   │   ├── config.go             # Wrapper 配置文件管理（ProgramData 持久化）+ 参数解析
+│   │   └── wrapper.go            # Windows 服务包装器（进程托管/日志/轮转/崩溃重启/优雅停止）
+│   ├── config/
+│   │   └── config.go             # 配置文件序列化（JSON 导入/导出 + DPAPI 密码加密）
+│   ├── common/
+│   │   └── path.go               # 共享路径处理函数（Wrapper BinaryPath 构建/解析）
+│   └── dpapi/
+│       └── dpapi.go              # Windows DPAPI 加密/解密（机器级作用域）
 │
 ├── frontend/                     # 前端源码
 │   ├── index.html                # HTML 入口
@@ -63,7 +82,14 @@ nssm-plus/
 │   └── src/
 │       ├── main.js               # Vue 应用挂载
 │       ├── style.css             # 全局样式 + CSS 变量（暗色主题）
-│       └── App.vue               # 唯一的 Vue 组件（全部 UI 逻辑）
+│       ├── App.vue               # 主组件（组合子组件）
+│       ├── components/
+│       │   ├── ServiceList.vue   # 服务列表侧边栏组件
+│       │   ├── ConfigForm.vue    # 服务配置表单组件（含环境变量/依赖编辑器）
+│       │   └── ActionBar.vue     # 操作按钮栏组件
+│       └── locales/
+│           ├── zh.json           # 中文语言包
+│           └── en.json           # 英文语言包
 │
 ├── build/
 │   └── appicon.png               # 应用图标
@@ -82,9 +108,9 @@ nssm-plus/
 ┌─────────────────────────────────────────────────────────────┐
 │                     WebView2 窗口                            │
 │  ┌─────────────────────────────────────────────────────────┐ │
-│  │              Vue 3 前端 (App.vue)                       │ │
+│  │              Vue 3 前端                                  │ │
 │  │  ┌──────────┐  ┌────────────┐  ┌──────────────┐        │ │
-│  │  │ 服务列表  │  │ 配置表单    │  │  操作按钮栏   │        │ │
+│  │  │ServiceList│  │ ConfigForm │  │  ActionBar   │        │ │
 │  │  └────┬─────┘  └─────┬──────┘  └──────┬───────┘        │ │
 │  └───────┼──────────────┼───────────────┼───────────────────┘ │
 │          │  window.go.main.App  (Wails 自动生成桥接)          │
@@ -96,19 +122,19 @@ nssm-plus/
 │  │  InstallService() │  │  │  nssm-plus.exe        │            │
 │  │  StartService()   │  │  │    service MySvc     │            │
 │  │  ...              │  │  │  → wrapper.Run()     │            │
-│  └────┬─────────┬───┘  │  ├─ GUI 模式（默认）     │            │
-│       │         │       │  │  → wails.Run()       │            │
-│  ┌────┴────┐ ┌─┴───┐   │  └──────────────────────┘            │
-│  │ service │ │config│   └────────────────────────┘             │
-│  │ manager │ │      │                                         │
-│  │ (SCM)   │ │(JSON)│                                         │
-│  └────┬────┘ └──────┘                                         │
-│       │                                                        │
-│  ┌────┴──────────┐                                             │
-│  │    wrapper     │  ← 服务包装器核心                          │
-│  │  config.go     │  WrapperConfig → ProgramData/NSSM-Plus/   │
-│  │  wrapper.go    │  svc.Handler → 启动/监控/停止子进程         │
-│  └───────────────┘                                             │
+│  └────┬─────────┬───┘  │  ├─ CLI 模式             │            │
+│       │         │       │  │  nssm-plus.exe install│            │
+│  ┌────┴────┐ ┌─┴───┐   │  │  → cli.Run()         │            │
+│  │ service │ │config│   │  ├─ GUI 模式（默认）     │            │
+│  │ manager │ │      │   │  │  → wails.Run()       │            │
+│  │ (SCM)   │ │(JSON)│   │  └──────────────────────┘            │
+│  └────┬────┘ └──┬───┘   └────────────────────────┘             │
+│       │         │                                             │
+│  ┌────┴─────────┴──┐  ┌──────────┐  ┌──────────┐              │
+│  │    wrapper       │  │  common   │  │  dpapi   │              │
+│  │  config.go       │  │  path.go  │  │  dpapi.go│              │
+│  │  wrapper.go      │  │ (共享路径) │  │ (加密)   │              │
+│  └─────────────────┘  └──────────┘  └──────────┘              │
 ├───────────────────────────────────────────────────────────────┤
 │                   Windows Service Control Manager              │
 └───────────────────────────────────────────────────────────────┘
@@ -147,10 +173,15 @@ NSSM Plus 的核心设计借鉴了 NSSM 的 Wrapper 模式。由于 `java.exe`�
 **Wrapper 配置结构**（`internal/wrapper/config.go`）：
 ```go
 type WrapperConfig struct {
-    AppPath   string            `json:"appPath"`   // 应用程序路径
-    Arguments string            `json:"arguments"` // 启动参数
-    WorkDir   string            `json:"workDir"`   // 工作目录
-    Env       map[string]string `json:"env"`       // 环境变量
+    AppPath        string            `json:"appPath"`        // 应用程序路径
+    Arguments      string            `json:"arguments"`      // 启动参数
+    WorkDir        string            `json:"workDir"`        // 工作目录
+    Env            map[string]string `json:"env"`            // 环境变量
+    RestartDelay   int               `json:"restartDelay"`   // 崩溃后重启延迟(秒)，0=不重启
+    LogStdout      string            `json:"logStdout"`      // 标准输出日志路径（空=默认路径）
+    LogStderr      string            `json:"logStderr"`      // 标准错误日志路径（空=跟随stdout）
+    RotateLog      bool              `json:"rotateLog"`      // 是否启用日志轮转
+    RestartTimeout int               `json:"restartTimeout"` // 优雅停止超时(秒)，默认5
 }
 ```
 
@@ -163,6 +194,8 @@ Wails 框架在编译时自动生成 Go → JS 绑定代码。前端通过 `wind
 window.go.main.App.InstallService(config)   // 安装服务
 window.go.main.App.StartService(name)       // 启动服务
 window.go.main.App.GetInstalledServices()   // 获取服务列表
+window.go.main.App.ShowOpenDialog(title)    // 打开文件选择对话框
+window.go.main.App.ShowSaveDialog(title)    // 打开文件保存对话框
 ```
 
 所有在 `app.go` 中定义的 `App` 结构体的公开方法，只要参数和返回值是可序列化类型，都会自动暴露给前端。
@@ -195,12 +228,13 @@ type ServiceConfig struct {
     Arguments      string            `json:"arguments"`      // 启动参数
     StartType      string            `json:"startType"`      // auto / demand / disabled
     Account        string            `json:"account"`        // 运行账户
-    Password       string            `json:"password"`       // 账户密码
+    Password       string            `json:"password"`       // 账户密码（DPAPI 加密存储）
     Environment    map[string]string `json:"environment"`    // 环境变量
     LogStdout      string            `json:"logStdout"`      // 标准输出日志路径
     LogStderr      string            `json:"logStderr"`      // 标准错误日志路径
     RotateLog      bool              `json:"rotateLog"`      // 日志轮转
     RestartDelay   int               `json:"restartDelay"`   // 崩溃后重启延迟(秒)
+    RestartTimeout int               `json:"restartTimeout"` // 优雅停止超时(秒)
     Dependencies   []string          `json:"dependencies"`   // 依赖服务
 }
 ```
@@ -238,6 +272,20 @@ type ServiceConfig struct {
 > Windows 11 和 Windows 10 (21H2+) 通常已内置 WebView2 Runtime。旧版本系统需手动安装：https://developer.microsoft.com/en-us/microsoft-edge/webview2/
 
 ## 快速开始
+
+### 方式零：使用一键脚本（最简单）
+
+```powershell
+# 1. 安装依赖（首次运行）
+.\Install.ps1
+
+# 2. 开发模式运行（热重载，需管理员终端）
+.\Run.ps1
+
+# 3. 生产构建
+.\Build.ps1
+# 产出: build/bin/nssm-plus.exe
+```
 
 ### 方式一：使用 Wails CLI（推荐，支持热重载）
 
@@ -293,6 +341,8 @@ npm run dev
 
 ## 使用方法
 
+### GUI 模式
+
 1. **以管理员身份运行** `nssm-plus.exe`
 2. 点击 **Open Config** 加载多服务配置文件（或点击 **New Config** 直接填写表单创建新服务）
 3. 侧栏会显示已安装服务和文件中未安装的服务（带 "File" 标签）
@@ -302,6 +352,46 @@ npm run dev
 7. **Uninstall** 卸载服务，**Delete** 仅清空当前表单
 8. 点击 **Save Config** 将所有已管理服务保存到一份 JSON 文件
 9. 点击 **Debug** 输出调试信息到控制台（按 F12 查看）
+
+### CLI 模式
+
+```bash
+# 安装服务
+nssm-plus install MyService --app "C:\java\bin\java.exe" --args "-jar app.jar"
+nssm-plus install MyService --app "node.exe" --dir "C:\myapp" --start auto --env "PORT=3000;NODE_ENV=prod"
+
+# 安全密码输入
+nssm-plus install MyService --app "app.exe" --account "DOMAIN\User" --password-stdin
+nssm-plus install MyService --app "app.exe" --account "DOMAIN\User" --password-file "C:\secrets\pw.txt"
+
+# 服务控制
+nssm-plus start MyService
+nssm-plus stop MyService
+nssm-plus restart MyService
+nssm-plus status MyService
+
+# 查看和编辑配置
+nssm-plus show MyService
+nssm-plus show MyService --json
+nssm-plus edit MyService --args "-jar app.jar --server.port=8081"
+nssm-plus edit MyService --restart-delay 5 --rotate-log
+
+# 列出服务
+nssm-plus list
+nssm-plus list --json
+
+# 查看日志
+nssm-plus log MyService
+nssm-plus log MyService --lines 100
+
+# 导入/导出
+nssm-plus export --output services.json
+nssm-plus export MyService --output myservice.json
+nssm-plus import services.json
+
+# 删除服务
+nssm-plus remove MyService
+```
 
 配置文件示例参见 [`configs/example.json`](configs/example.json)。
 
@@ -326,9 +416,9 @@ npm run dev
 **常见修改场景**：
 
 - **增加服务配置字段**：在 `ServiceConfig` 结构体中添加字段，然后在 `Install()` 和 `Modify()` 中将新字段写入 `mgr.Config`
-- **自定义日志路径**：当前日志固定输出到 `%ProgramData%\NSSM-Plus\logs\`，可在 `WrapperConfig` 中增加 `LogPath` 字段，并修改 `wrapper.go` 的日志重定向逻辑
-- **实现崩溃重启**：在 `wrapper.go` 的 `Execute()` 方法中，当子进程非正常退出时，按 `RestartDelay` 延迟后重新启动
-- **修改停止策略**：当前使用 `taskkill /T /PID`（优雅 5s + 强制），可在 `stopProcess()` 函数中调整超时时间和终止策略
+- **自定义日志路径**：通过 `WrapperConfig.LogStdout` / `LogStderr` 设置自定义日志路径，空值时使用默认 `%ProgramData%\NSSM-Plus\logs\` 路径
+- **实现崩溃重启**：通过 `WrapperConfig.RestartDelay` 配置重启延迟（秒），进程异常退出后自动恢复
+- **修改停止策略**：通过 `WrapperConfig.RestartTimeout` 配置优雅停止超时时间（默认 5 秒），超时后强制终止
 
 ### 2. 添加新的前后端桥接方法
 
@@ -353,10 +443,18 @@ const logs = await call('GetServiceLogs', serviceName)
 
 ### 3. 修改 GUI 界面
 
-**文件**: `frontend/src/App.vue`（模板 + 脚本 + 样式）
+**文件**: `frontend/src/App.vue`（主组件）+ `frontend/src/components/`（子组件）
 **全局样式**: `frontend/src/style.css`（CSS 变量定义）
 
-当前所有 UI 逻辑集中在一个 `App.vue` 组件中。界面布局分三层：
+前端已拆分为三个子组件：
+
+| 组件 | 文件 | 职责 |
+|------|------|------|
+| ServiceList | `components/ServiceList.vue` | 服务列表侧边栏，显示已安装和文件中的服务 |
+| ConfigForm | `components/ConfigForm.vue` | 配置表单，含环境变量 KV 编辑器和依赖管理 |
+| ActionBar | `components/ActionBar.vue` | 操作按钮栏，安装/启动/停止/重启等 |
+
+界面布局分三层：
 
 ```
 ┌──────────────────────────────────────────┐
@@ -373,7 +471,7 @@ const logs = await call('GetServiceLogs', serviceName)
 
 **常见修改场景**：
 
-- **拆分组件**：将 `ServiceList`、`ConfigForm`、`ActionBar` 拆分为独立的 `.vue` 文件，放入 `frontend/src/components/` 目录
+- **添加新子组件**：在 `frontend/src/components/` 目录创建新的 `.vue` 文件，在 `App.vue` 中导入并使用
 - **更换 UI 框架**：安装 Element Plus / Ant Design Vue 等，替换原生 HTML 表单控件
 - **添加 Tab 页**：如需要"日志查看"等功能页，在 `app-body` 中用 `v-if/v-show` 切换视图
 - **改用 TypeScript**：将 `App.vue` 的 `<script>` 改为 `<script setup lang="ts">`，并创建 `.d.ts` 类型声明
@@ -406,12 +504,16 @@ err := wails.Run(&options.App{
 })
 ```
 
-### 6. 添加多语言支持 (i18n)
+### 6. 多语言支持 (i18n)
 
-1. 安装 `vue-i18n`：`npm install vue-i18n`
-2. 在 `frontend/src/` 下创建 `locales/zh.json` 和 `locales/en.json`
-3. 在 `main.js` 中配置 i18n 插件
-4. 在 `App.vue` 中将硬编码文本替换为 `$t('key')`
+项目已集成 `vue-i18n`，语言包位于 `frontend/src/locales/`：
+
+- `zh.json` - 中文
+- `en.json` - 英文
+
+切换语言：前端界面右上角的语言切换按钮，或修改 `App.vue` 中的 `locale.value`。
+
+添加新语言：在 `locales/` 目录创建新的 JSON 文件，并在 `main.js` 中注册。
 
 ### 7. 关键注意事项
 
@@ -426,16 +528,22 @@ err := wails.Run(&options.App{
 
 | 特性 | NSSM | NSSM Plus |
 |------|------|-----------|
-| 操作方式 | 命令行 `nssm.exe install` | GUI 界面直接操作 |
+| 操作方式 | 命令行 `nssm.exe install` | GUI 界面 + 完整 CLI |
 | 配置界面 | Tab 页切换 (5+ 个 Tab) | 单页面，无需切换 |
 | 配置迁移 | 无内置支持 | 多服务 JSON 文件统一管理 |
-| 界面语言 | 英文 | 可扩展多语言 |
+| 界面语言 | 英文 | 多语言 (i18n) |
 | 服务包装 | Wrapper 二进制托管进程 | 自托管 Wrapper 模式（同一可执行文件） |
-| 日志重定向 | 支持 stdout/stderr 捕获 | 已实现，输出到 `%ProgramData%\NSSM-Plus\logs\` |
-| 崩溃重启 | 内置 | 字段已预留（待实现） |
-| 进程停止 | 直接终止 | 优雅停止（taskkill /T）+ 强制终止（5s 超时后 taskkill /F） |
-| 环境变量 | 支持 | 已实现，通过 WrapperConfig.Env 注入 |
-| 工作目录 | 支持 | 已实现，通过 WrapperConfig.WorkDir 设置 |
+| 日志重定向 | 支持 stdout/stderr 捕获 | 支持，可自定义路径，输出到 `%ProgramData%\NSSM-Plus\logs\` |
+| 日志轮转 | 不支持 | 支持，按大小自动轮转，保留 5 份历史 |
+| 崩溃重启 | 内置 | 支持，可配置重启延迟 |
+| 进程停止 | 直接终止 | 优雅停止 + 可配置超时 + 强制终止 |
+| 环境变量 | 支持 | 支持，GUI 可视化编辑 |
+| 服务依赖 | 支持 | 支持，GUI 可视化编辑 |
+| 密码安全 | 明文存储 | DPAPI 机器级加密存储 |
+| CLI 密码安全 | 明文参数 | 支持 --password-stdin / --password-file |
+| 工作目录 | 支持 | 支持 |
+| 命令行模式 | 仅命令行 | GUI + CLI 双模式，CLI 支持 show/edit/log/export/import |
+| 服务状态监控 | 无 | 10 秒自动刷新 |
 | BinaryPathName | `nssm.exe` 指向目标程序 | 自身 exe 作为 Wrapper，避免 `syscall.EscapeArg` 问题 |
 | 跨平台 | 仅 Windows | 仅 Windows |
 
@@ -445,23 +553,36 @@ err := wails.Run(&options.App{
 
 - [x] **服务包装器架构** - `internal/wrapper/` 模块，实现 `svc.Handler` 接口
 - [x] **日志重定向** - 子进程 stdout/stderr 输出到 `%ProgramData%\NSSM-Plus\logs\<name>.log`
+- [x] **自定义日志路径** - `LogStdout` / `LogStderr` 支持自定义路径，空值时使用默认路径
+- [x] **日志轮转** - `RotateLog` 按文件大小自动轮转，保留 5 份历史日志
 - [x] **环境变量注入** - 通过 `WrapperConfig.Env` 在启动子进程时注入自定义环境变量
+- [x] **环境变量编辑器** - 前端可视化 Key-Value 编辑器，支持增删改
+- [x] **服务依赖管理** - 前端可视化添加/移除服务依赖项
 - [x] **工作目录设置** - 通过 `WrapperConfig.WorkDir` 设置子进程的 `cwd`
-- [x] **优雅停止** - 先 `taskkill /T /PID`（5s 超时），再 `taskkill /F /T /PID` 强制终止
+- [x] **崩溃自动重启** - `RestartDelay` 配置重启延迟，进程异常退出后自动恢复
+- [x] **优雅停止** - 先 `taskkill /T /PID`（可配置超时），再 `taskkill /F /T /PID` 强制终止
 - [x] **Wrapper 配置持久化** - `ProgramData/NSSM-Plus/services/<name>.json` 独立存储
 - [x] **进程树终止** - 通过 `/T` 参数终止子进程及其所有衍生进程（如 java.exe → 子线程）
-- [x] **控制台调试模式** - 非服务环境下可直接运行 wrapper 进行调试
+- [x] **控制台调试模式** - 非服务环境下可直接运行 wrapper 进行调试，支持 Ctrl+C 优雅退出
 - [x] **原生文件对话框** - 使用 Wails 的 `runtime.SaveFileDialog` / `runtime.OpenFileDialog`
 - [x] **DisplayName/Description 自动填充** - 输入 ServiceName 后点击对应字段自动填充
+- [x] **DPAPI 密码加密** - 使用 Windows DPAPI 机器级加密（`CRYPTPROTECT_LOCAL_MACHINE`），服务账户可正常解密
+- [x] **安全密码输入** - CLI 支持 `--password-stdin` 和 `--password-file`，避免密码明文暴露在进程列表
+- [x] **命令行模式** - 完整 CLI 支持 install/remove/start/stop/restart/status/show/edit/list/log/export/import
+- [x] **CLI --json 输出** - `list` 和 `show` 命令支持 `--json` 格式化输出
+- [x] **服务状态自动刷新** - 前端 10 秒定时刷新已安装服务状态
+- [x] **前端组件化** - App.vue 拆分为 ServiceList / ConfigForm / ActionBar 子组件
+- [x] **共享代码提取** - `internal/common/path.go` 提取 Wrapper BinaryPath 构建和解析函数
+- [x] **详细日志记录** - 所有核心分支添加 `log.Printf` 日志，统一 `[模块名]` 前缀
+- [x] **配置文件安全** - `SaveToFile` 创建副本加密，不修改输入参数；`LoadFromFile` 兼容三种格式
+- [x] **参数转义支持** - `splitArgs` 支持 `\"` 和 `\\` 转义字符
+- [x] **服务重启等待** - `Restart()` 等待服务完全停止后再启动（最多 15 秒）
 
 ## 待完成功能
 
-- [ ] **日志轮转** - `RotateLog` 字段已定义，需实现按大小/日期切割日志文件
-- [ ] **崩溃自动重启** - `RestartDelay` / `RestartTimeout` 字段已定义，需实现进程监控和自动重启
-- [ ] **自定义日志路径** - `LogStdout` / `LogStderr` 字段已定义，当前固定输出到 ProgramData，需支持自定义路径
 - [ ] **服务重命名** - 当前 `Modify` 不支持更改服务名称
-- [ ] **多语言支持 (i18n)** - UI 文本硬编码为中文/英文混合
 - [ ] **系统托盘** - 最小化到系统托盘，后台运行
+- [ ] **日志查看页面** - GUI 内直接查看服务日志，支持实时滚动
 
 ## License
 

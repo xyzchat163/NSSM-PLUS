@@ -1,0 +1,63 @@
+<template>
+  <footer class="action-bar">
+    <div class="action-left">
+      <button class="btn-secondary" @click="$emit('new')">
+        <span class="icon">+</span> {{ t('action.newConfig') }}
+      </button>
+      <button class="btn-secondary" @click="$emit('load')">
+        <span class="icon">&#x1F4C2;</span> {{ t('action.openConfig') }}
+      </button>
+      <button class="btn-secondary" @click="$emit('save')">
+        <span class="icon">&#x1F4BE;</span> {{ t('action.saveConfig') }}
+      </button>
+      <button class="btn-primary" @click="$emit('save-service')" :disabled="!isEditing || !configFilePath">
+        <span class="icon">&#x1F4C4;</span> {{ t('action.saveService') }}
+      </button>
+    </div>
+    <div class="action-right">
+      <button class="btn-primary" @click="$emit('install')" :disabled="!config.serviceName || !config.appPath || (isEditing && source === 'installed')">
+        {{ t('action.install') }}
+      </button>
+      <button class="btn-warning" @click="$emit('reconfigure')" :disabled="!isEditing || source !== 'installed'">
+        {{ t('action.reconfigure') }}
+      </button>
+      <button class="btn-success" @click="$emit('start')" :disabled="!isEditing || source !== 'installed'">
+        {{ t('action.start') }}
+      </button>
+      <button class="btn-warning" @click="$emit('stop')" :disabled="!isEditing || source !== 'installed'">
+        {{ t('action.stop') }}
+      </button>
+      <button class="btn-secondary" @click="$emit('restart')" :disabled="!isEditing || source !== 'installed'">
+        {{ t('action.restart') }}
+      </button>
+      <button class="btn-secondary" @click="$emit('check')" :disabled="!config.serviceName">
+        {{ t('action.check') }}
+      </button>
+      <button class="btn-danger" @click="$emit('uninstall')" :disabled="!isEditing || source !== 'installed'">
+        {{ t('action.uninstall') }}
+      </button>
+      <button class="btn-danger" @click="$emit('delete')" :disabled="!isEditing">
+        {{ t('action.delete') }}
+      </button>
+    </div>
+  </footer>
+</template>
+
+<script>
+import { useI18n } from 'vue-i18n'
+
+export default {
+  name: 'ActionBar',
+  props: {
+    config: { type: Object, required: true },
+    isEditing: { type: Boolean, default: false },
+    configFilePath: { type: String, default: '' },
+    source: { type: String, default: '' },
+  },
+  emits: ['new', 'load', 'save', 'save-service', 'install', 'reconfigure', 'start', 'stop', 'restart', 'check', 'uninstall', 'delete'],
+  setup() {
+    const { t } = useI18n()
+    return { t }
+  },
+}
+</script>
